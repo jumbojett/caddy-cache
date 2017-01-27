@@ -18,7 +18,8 @@ type TestHandler struct {
 	maxConcurrencyLevel     int
 	currentConcurrencyLevel int
 	StatsLock               *sync.Mutex
-	Delay                   time.Duration
+	Latency                 time.Duration
+	TimeToEnd               time.Duration
 	timesCalled             int
 	ResponseBody            []byte
 	ResponseCode            int
@@ -48,17 +49,6 @@ func (h *TestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, er
 	// Update concurrency stats
 	h.StatsLock.Lock()
 	h.timesCalled++
-	h.StatsLock.Unlock()
-
-	for k, values := range h.ResponseHeaders {
-		for _, v := range values {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(h.ResponseCode)
-
-	// Update concurrency stats
-	h.StatsLock.Lock()
 	h.currentConcurrencyLevel++
 	if h.currentConcurrencyLevel > h.maxConcurrencyLevel {
 		h.maxConcurrencyLevel = h.currentConcurrencyLevel
@@ -70,7 +60,14 @@ func (h *TestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, er
 		h.StatsLock.Unlock()
 	}()
 
-	time.Sleep(h.Delay)
+	time.Sleep(h.Latency)
+
+	for k, values := range h.ResponseHeaders {
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(h.ResponseCode)
 
 	if h.ResponseBody != nil && r.Method != "HEAD" {
 		w.Write(h.ResponseBody)
@@ -78,6 +75,8 @@ func (h *TestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, er
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+
+	time.Sleep(h.TimeToEnd)
 	return h.ResponseCode, h.ResponseError
 }
 
@@ -85,7 +84,7 @@ func buildHandlerWithCache(cache *Cache) (*CacheHandler, *TestHandler) {
 	backend := TestHandler{
 		ResponseBody: []byte("Hello :)"),
 		StatsLock:    new(sync.Mutex),
-		Delay:        0,
+		Latency:        0,
 		ResponseCode: 200,
 	}
 
@@ -438,7 +437,7 @@ func TestStatusCode(t *testing.T) {
 func TestLockOnCacheableReq(t *testing.T) {
 	handler, backend := buildBasicHandler()
 
-	backend.Delay = time.Duration(10) * time.Millisecond
+	backend.Latency = time.Duration(10) * time.Millisecond
 	backend.ResponseHeaders = http.Header{
 		"Cache-control": []string{"public; max-age=3600"},
 	}
@@ -453,17 +452,13 @@ func TestLockOnCacheableReq(t *testing.T) {
 	assert.Equal(t, 0, backend.ConcurrencyLevel(), "There are more conccurrent requests than expected")
 	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "There were more conccurrent requests than expected")
 	assert.Equal(t, 1, backend.TimesCalled(), "Backend was called more times than expected")
-
-	time.Sleep(time.Duration(10) * time.Millisecond)
-	assert.Equal(t, 0, backend.ConcurrencyLevel(), "There are more conccurrent requests than expected")
-	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "There were more conccurrent requests than expected")
-	assert.Equal(t, 1, backend.TimesCalled(), "Backend was called more times than expected")
 }
 
 func TestLockOnNonCacheableReq(t *testing.T) {
 	handler, backend := buildBasicHandler()
 
-	backend.Delay = time.Duration(10) * time.Millisecond
+	backend.Latency = time.Duration(10) * time.Millisecond
+	backend.TimeToEnd = time.Duration(10) * time.Millisecond
 	backend.ResponseHeaders = http.Header{
 		"Cache-control": []string{"private"},
 	}
@@ -475,20 +470,26 @@ func TestLockOnNonCacheableReq(t *testing.T) {
 	assert.Equal(t, 1, backend.TimesCalled(), "Backend was called more times than expected")
 
 	time.Sleep(time.Duration(10) * time.Millisecond)
+	assert.Equal(t, 10, backend.ConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 10, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 10, backend.TimesCalled(), "Backend was called different times than expected")
+
+	time.Sleep(time.Duration(10) * time.Millisecond)
 	assert.Equal(t, 9, backend.ConcurrencyLevel(), "The locking is incorrect")
-	assert.Equal(t, 9, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 10, backend.MaxConcurrencyLevel(), "The locking is incorrect")
 	assert.Equal(t, 10, backend.TimesCalled(), "Backend was called different times than expected")
 
 	time.Sleep(time.Duration(10) * time.Millisecond)
 	assert.Equal(t, 0, backend.ConcurrencyLevel(), "The locking is incorrect")
-	assert.Equal(t, 9, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 10, backend.MaxConcurrencyLevel(), "The locking is incorrect")
 	assert.Equal(t, 10, backend.TimesCalled(), "Backend was called different times than expected")
 }
 
 func TestLockOnVaryHeaderRequests(t *testing.T) {
 	handler, backend := buildBasicHandler()
 
-	backend.Delay = time.Duration(10) * time.Millisecond
+	backend.Latency = time.Duration(10) * time.Millisecond
+	backend.TimeToEnd = time.Duration(10) * time.Millisecond
 	backend.ResponseHeaders = http.Header{
 		"Vary":          []string{"Accept-Encoding"},
 		"Cache-control": []string{"public; max-age=3600"},
@@ -510,25 +511,31 @@ func TestLockOnVaryHeaderRequests(t *testing.T) {
 	assert.Equal(t, 1, backend.TimesCalled(), "Backend was called more times than expected")
 
 	time.Sleep(time.Duration(10) * time.Millisecond)
-	assert.Equal(t, 1, backend.ConcurrencyLevel(), "The locking is incorrect")
-	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.ConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.MaxConcurrencyLevel(), "The locking is incorrect")
 	assert.Equal(t, 2, backend.TimesCalled(), "Backend was called different times than expected")
 
 	time.Sleep(time.Duration(10) * time.Millisecond)
-	assert.Equal(t, 1, backend.ConcurrencyLevel(), "The locking is incorrect")
-	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.ConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.MaxConcurrencyLevel(), "The locking is incorrect")
 	assert.Equal(t, 3, backend.TimesCalled(), "Backend was called different times than expected")
 
 	time.Sleep(time.Duration(10) * time.Millisecond)
+	assert.Equal(t, 1, backend.ConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 3, backend.TimesCalled(), "Backend was called different times than expected")
+
+
+	time.Sleep(time.Duration(10) * time.Millisecond)
 	assert.Equal(t, 0, backend.ConcurrencyLevel(), "The locking is incorrect")
-	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "The locking is incorrect")
+	assert.Equal(t, 2, backend.MaxConcurrencyLevel(), "The locking is incorrect")
 	assert.Equal(t, 3, backend.TimesCalled(), "Backend was called different times than expected")
 }
 
 func TestLockOnMixedContent(t *testing.T) {
 	handler, backend := buildBasicHandler()
 
-	backend.Delay = time.Duration(10) * time.Millisecond
+	backend.Latency = time.Duration(10) * time.Millisecond
 	backend.ResponseHeaders = http.Header{
 		"Cache-control": []string{"private"},
 	}
@@ -581,4 +588,22 @@ func TestMMapWritesToDisk(t *testing.T) {
 		return nil, nil
 	})
 	assert.NoError(t, err, "There was an error in GetOrLock")
+}
+
+
+func TestStreamContent(t *testing.T) {
+/*	handler, backend := buildBasicHandler()
+
+	backend.Latency = time.Duration(10) * time.Millisecond
+	backend.TimeToEnd = time.Duration(10) * time.Millisecond
+	backend.ResponseHeaders = http.Header{ "Cache-control": []string{"public; max-age=3600"} }
+
+	go makeNConcurrentRequests(handler, 2, buildGetRequest("http://somehost.com/"))
+	time.Sleep(time.Duration(5) * time.Millisecond)
+	assert.Equal(t, 1, backend.ConcurrencyLevel(), "There are more conccurrent requests than expected")
+	assert.Equal(t, 1, backend.MaxConcurrencyLevel(), "There were more conccurrent requests than expected")
+	assert.Equal(t, 1, backend.TimesCalled(), "Backend was called more times than expected")
+
+	time.Sleep(time.Duration(15) * time.Millisecond)
+*/
 }

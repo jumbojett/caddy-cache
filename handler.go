@@ -7,6 +7,9 @@ import (
 	"reflect"
 	"strings"
 	"time"
+	"io"
+	"runtime"
+	"strconv"
 )
 
 type CacheHandler struct {
@@ -15,17 +18,17 @@ type CacheHandler struct {
 	Next   httpserver.Handler
 }
 
-func respond(response *Response, w http.ResponseWriter) {
-	for k, values := range response.HeaderMap {
-		for _, v := range values {
-			w.Header().Add(k, v)
-		}
+func goid() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(fmt.Sprintf("cannot get goroutine id: %v", err))
 	}
-	w.WriteHeader(response.Code)
-	if response.Body != nil {
-		w.Write(response.Body.Bytes())
-	}
+	return id
 }
+
 
 /**
  * Builds the cache key
@@ -83,89 +86,74 @@ func (h *CacheHandler) RemoveStatusHeaderIfConfigured(headers http.Header) http.
 
 func (handler *CacheHandler) HandleCachedResponse(w http.ResponseWriter, r *http.Request, previous *HttpCacheEntry) int {
 	handler.AddStatusHeaderIfConfigured(w, "hit")
-	respond(previous.Response, w)
+	for k, values := range previous.Response.HeaderMap {
+		for _, v := range values {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(previous.Response.Code)
+	if previous.Response.Body != nil {
+		io.Copy(w, previous.Response.Body.GetReader())
+	}
 	return previous.Response.Code
 }
 
-func (handler *CacheHandler) HandleNonCachedResponse(w http.ResponseWriter, r *http.Request) (*HttpCacheEntry, error) {
-	key := getKey(r)
-	rec := NewStreamedRecorder(w)
-
-	// Build the cache entry
+func (handler *CacheHandler) HandleNonCachedResponse(w http.ResponseWriter, r *http.Request) (*HttpCacheEntry, chan struct {}, error) {
 	entry := &HttpCacheEntry{
 		isPublic:   false, // Default values for private responses
 		Expiration: time.Now().UTC().Add(time.Duration(1) * time.Hour),
 		Request:    &Request{HeaderMap: r.Header},
-		Response:   nil,
 	}
 
-	// Create a callback on response recorder
-	// So as soon as the first byte is sent, check the headers
-	// If the response is cacheable, a new entry will be created
-	// And the response will be saved. In case the mmap storage is
-	// being used, the response will be saved to a file
-	rec.SetFirstWriteListener(func(Code int, Header http.Header) error {
-		isCacheable, expirationTime, err := getCacheableStatus(r, Code, Header, handler.Config)
-		if err != nil {
-			// getCacheableStatus may return an error when it fails to parse
-			// Some header, but it is not be a problem here.
-			// Just ignore it and don't cache that response.
-			return nil
-		}
+	pipe := PipeHandlerToChannels(handler.Next, w, r)
 
-		// If it's not cacheable do nothing
-		if !isCacheable {
-			return nil
-		}
+	// Fetch from upstream in another thread
+	go pipe.handle()
 
-		// Update the expiration value
-		entry.Expiration = expirationTime
-		entry.isPublic = true
+	// Wait until headers
+	headers := <- pipe.HeaderChannel()
 
-		// Create the new entry, potentially creating a new file in disk
-		writer, err := handler.Cache.NewContent(key)
-		if err != nil {
-			fmt.Println(err)
-			return err
-		}
-
-		// Update the body writer, next Writes will go to the created writer
-		rec.UpdateBodyWriter(writer)
-		return nil
-	})
-
-	// Send the status header and server the request from upstream
-	handler.AddStatusHeaderIfConfigured(w, "miss")
-	_, err := handler.Next.ServeHTTP(rec, r)
+	// Check if the request is cacheable
+	isCacheable, expirationTime, err := getCacheableStatus(r, headers.StatusCode, *headers.Header, handler.Config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	result, Body := rec.Result()
+
+	if !isCacheable {
+		handler.AddStatusHeaderIfConfigured(w, "miss")
+		entry.isPublic = false
+		entry.Response = &Response{ HeaderMap: *headers.Header, Code: headers.StatusCode }
+		return entry, nil, nil
+	}
+
+	// if it is create a new content writer
+	bodyWriter, err := handler.Cache.NewContent(getKey(r))
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Set entry fields
+	entry.Expiration = expirationTime
+	entry.isPublic = true
 	entry.Response = &Response{
-		HeaderMap: handler.RemoveStatusHeaderIfConfigured(result.Header),
-		Code:      result.StatusCode,
+		HeaderMap: *headers.Header,
+		Body:      bodyWriter,
+		Code:      headers.StatusCode,
 	}
 
-	// If the body was recorded, close the body and update the entry
-	if Body != nil {
-		Body.Close()
-		entry.Response.Body = Body
-	}
-
-	// This is an special case because if it is a head request it will never enter the WriteListener
-	if r.Method == "HEAD" {
-		isCacheable, expirationTime, err := getCacheableStatus(r, result.StatusCode, result.Header, handler.Config)
-		if err != nil {
-			return nil, err
+	endChannel := make(chan struct{})
+	// Create a new thread that will save the fetched bytes to the content
+	go func() {
+		for content := range pipe.BodyChannel() {
+			bodyWriter.Write(content)
 		}
-		if isCacheable {
-			entry.Expiration = expirationTime
-			entry.isPublic = true
-		}
-	}
+		bodyWriter.Close()
+		endChannel <- struct{}{}
+	}()
 
-	return entry, nil
+	return entry, endChannel, nil
 }
 
 func (handler CacheHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
@@ -174,19 +162,28 @@ func (handler CacheHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (i
 		return handler.Next.ServeHTTP(w, r)
 	}
 
+	var endChannel chan struct{}
 	returnedStatusCode := http.StatusInternalServerError // If this is not updated means there was an error
 	err := handler.Cache.GetOrSet(getKey(r), matchesRequest(r), func(previous *HttpCacheEntry) (*HttpCacheEntry, error) {
 		if previous == nil || !previous.isPublic {
-			newEntry, err := handler.HandleNonCachedResponse(w, r)
+			newEntry, endChn, err := handler.HandleNonCachedResponse(w, r)
 			if err != nil {
+				fmt.Println(goid(), err.Error())
 				return nil, err
 			}
+			endChannel = endChn
 			returnedStatusCode = newEntry.Response.Code
 			return newEntry, nil
 		}
 
+		fmt.Println(goid(), "Usando la respuesta cacheda")
+		handler.AddStatusHeaderIfConfigured(w, "hit")
 		returnedStatusCode = handler.HandleCachedResponse(w, r, previous)
 		return nil, nil
 	})
+	if endChannel != nil {
+		<- endChannel
+		fmt.Println(goid(), "Termino el req original")
+	}
 	return returnedStatusCode, err
 }
