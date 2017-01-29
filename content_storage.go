@@ -10,10 +10,9 @@ import (
 	"math/rand"
 	"os"
 	"path"
-	"syscall"
 	"sync"
+	"syscall"
 )
-
 
 /* Storage */
 type Storage interface {
@@ -33,19 +32,20 @@ type MemoryStorage struct{}
 
 type DataContainer struct {
 	data []byte
+	lock *sync.RWMutex
 }
 
 type MemoryData struct {
-	content         *DataContainer
+	content *DataContainer
 
-	subscribers     []*PartiallyContentReader
+	subscribers     []*ContentReader
 	subscribersLock *sync.RWMutex
 
-	isClosed        bool
-	isClosedLock    *sync.RWMutex
+	isClosed     bool
+	isClosedLock *sync.RWMutex
 }
 
-type PartiallyContentReader struct {
+type ContentReader struct {
 	offset      int
 	content     *DataContainer
 	moreContent chan struct{}
@@ -61,24 +61,24 @@ func (s *MemoryStorage) Setup() error {
 
 func (s *MemoryStorage) NewContent(key string) (StorageContent, error) {
 	return &MemoryData{
-		content: 		 &DataContainer{ data: []byte{} },
+		content:         &DataContainer{data: []byte{}, lock: new(sync.RWMutex)},
 		subscribersLock: new(sync.RWMutex),
-		isClosedLock: 	 new(sync.RWMutex),
+		isClosedLock:    new(sync.RWMutex),
 	}, nil
 }
 
 func (buff *MemoryData) Write(p []byte) (int, error) {
+	buff.content.lock.Lock()
 	buff.content.data = append(buff.content.data, p...)
+	buff.content.lock.Unlock()
 
-	fmt.Println("New len=", len(buff.content.data))
+	buff.subscribersLock.RLock()
 	for _, subscriber := range buff.subscribers {
-		buff.subscribersLock.RLock()
-		go func (subscriber *PartiallyContentReader) {
-			fmt.Println("Enviando moreContent signal")
+		go func(subscriber *ContentReader) {
 			subscriber.moreContent <- struct{}{}
-			buff.subscribersLock.RUnlock()
 		}(subscriber)
 	}
+	buff.subscribersLock.RUnlock()
 
 	return len(p), nil
 }
@@ -92,15 +92,14 @@ func (buff *MemoryData) GetReader() io.Reader {
 		return bytes.NewReader(buff.content.data[0:])
 	}
 
-	reader := &PartiallyContentReader{
+	reader := &ContentReader{
 		moreContent: make(chan struct{}),
-		content:   buff.content,
-		offset:    0,
+		content:     buff.content,
 	}
 
 	buff.subscribersLock.Lock()
-	defer buff.subscribersLock.Unlock()
 	buff.subscribers = append(buff.subscribers, reader)
+	buff.subscribersLock.Unlock()
 
 	return reader
 }
@@ -108,17 +107,16 @@ func (buff *MemoryData) GetReader() io.Reader {
 func (buff *MemoryData) Close() error {
 	// TODO should this return an error if it was already closed?
 	buff.isClosedLock.Lock()
+	defer buff.isClosedLock.Unlock()
 	buff.isClosed = true
-	buff.isClosedLock.Unlock()
 
-	fmt.Println("Close")
+	buff.subscribersLock.Lock()
 	for _, subscriber := range buff.subscribers {
-		buff.subscribersLock.Lock()
-		go func (subscriber *PartiallyContentReader) {
+		go func(subscriber *ContentReader) {
 			close(subscriber.moreContent)
-			buff.subscribersLock.Unlock()
 		}(subscriber)
 	}
+	buff.subscribersLock.Unlock()
 
 	// TODO Remove subscribers
 	return nil
@@ -128,24 +126,21 @@ func (buff *MemoryData) Clear() error {
 	return nil
 }
 
+func (reader *ContentReader) Read(p []byte) (int, error) {
+	reader.content.lock.RLock()
+	n := copy(p, reader.content.data[reader.offset:])
+	reader.content.lock.RUnlock()
 
-func (reader *PartiallyContentReader) Read(p []byte) (int, error) {
-	// TODO add mutex
-	if reader.offset < len(reader.content.data) {
-		n := copy(p, reader.content.data[reader.offset:])
+	if n > 0 {
 		reader.offset += n
 		return n, nil
-	} else {
-		for range reader.moreContent {
-			if len(reader.content.data[reader.offset:]) == 0 {
-				continue
-			}
-			n := copy(p, reader.content.data[reader.offset:])
-			reader.offset += n
-			return n, nil
-		}
-		return 0, io.EOF
 	}
+
+	for range reader.moreContent {
+		return reader.Read(p)
+	}
+
+	return 0, io.EOF
 }
 
 /*

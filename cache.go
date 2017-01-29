@@ -5,7 +5,6 @@ import (
 	"math"
 	"sync"
 	"time"
-	"log"
 )
 
 const bucketsSize = 256
@@ -121,7 +120,6 @@ func (s *Cache) GetOrSet(key string, condition func(*HttpCacheEntry) bool, handl
 
 	newValue, err := handler(nil)
 	if err != nil || newValue == nil {
-		log.Println(err)
 		return err
 	}
 

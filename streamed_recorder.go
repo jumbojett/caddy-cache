@@ -1,8 +1,8 @@
 package cache
 
 import (
-	"net/http"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
+	"net/http"
 )
 
 /**
@@ -15,13 +15,13 @@ import (
 
 type HttpHeader struct {
 	StatusCode int
-	Header 	   *http.Header
+	Header     *http.Header
 }
 
 type StreamedRecorder struct {
-	handler httpserver.Handler
-	w  http.ResponseWriter // This is the downstream
-	r *http.Request
+	handler     httpserver.Handler
+	w           http.ResponseWriter // This is the downstream
+	r           *http.Request
 	wroteHeader bool
 
 	bodyChannel   chan []byte
@@ -31,17 +31,18 @@ type StreamedRecorder struct {
 
 func PipeHandlerToChannels(handler httpserver.Handler, w http.ResponseWriter, r *http.Request) *StreamedRecorder {
 	return &StreamedRecorder{
-		handler:             handler,
-		w:                   w,
-		r:					 r,
-		wroteHeader:         false,
-		bodyChannel:         make(chan []byte),
-		headerChannel:		make(chan *HttpHeader),
+		handler:       handler,
+		w:             w,
+		r:             r,
+		wroteHeader:   false,
+		bodyChannel:   make(chan []byte),
+		headerChannel: make(chan *HttpHeader),
 	}
 }
 
-func (rw *StreamedRecorder) handle()  {
+func (rw *StreamedRecorder) handle() {
 	rw.handler.ServeHTTP(rw, rw.r)
+	//fmt.Println("Desde el recorder termino ServerHTTP, cerrando body channel")
 	close(rw.bodyChannel)
 }
 
@@ -55,7 +56,9 @@ func (rw *StreamedRecorder) Write(buf []byte) (int, error) {
 	if !rw.wroteHeader {
 		rw.WriteHeader(200)
 	}
+	//fmt.Println("Enviando contenido al bodyChannel, se bloqueo?")
 	rw.bodyChannel <- buf
+	//fmt.Println("Salio de enviar al bodychannel")
 	return rw.w.Write(buf)
 }
 
@@ -69,11 +72,10 @@ func (rw *StreamedRecorder) WriteHeader(code int) {
 	rw.wroteHeader = true
 	rw.headerChannel <- &HttpHeader{
 		StatusCode: code,
-		Header: cloneHeader(rw.w.Header()),
+		Header:     cloneHeader(rw.w.Header()),
 	}
 	rw.w.WriteHeader(code)
 }
-
 
 func (rw *StreamedRecorder) HeaderChannel() <-chan *HttpHeader {
 	return rw.headerChannel
